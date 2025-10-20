@@ -5,13 +5,30 @@
 
 typedef struct {
     GtkStatusbar *statusbar;
-    GtkListStore *stores[3]; /* each store has 3 columns: Name, State, Description */
+    GtkListStore *stores[3];               /* underlying list stores (4 cols: name,state,pid,desc) */
+    GtkTreeModelFilter *filters[3];        /* filter wrappers used by the tree-views */
+    GtkWidget *filter_entry;               /* common filter entry */
 } AppData;
 
 static void trim_newline(char *s) {
     size_t n = strlen(s);
     if (n == 0) return;
     if (s[n-1] == '\n') s[n-1] = '\0';
+}
+
+/* helper: read a single systemctl show property value for a unit into out (trims newline) */
+static void get_unit_property_value(const char *unit, const char *prop, char *out, size_t n) {
+    if (!unit || !prop || !out || n == 0) { if (out) out[0] = '\0'; return; }
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "systemctl show -p %s --value %s 2>/dev/null", prop, unit);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) { out[0] = '\0'; return; }
+    if (fgets(out, n, fp)) {
+        trim_newline(out);
+    } else {
+        out[0] = '\0';
+    }
+    pclose(fp);
 }
 
 /* Parse a "list-units" line:
@@ -71,7 +88,7 @@ static void parse_list_unit_files_line(const char *line, char *out_name, size_t 
     out_desc[0] = '\0';
 }
 
-/* populate a GtkListStore (3 columns: name,state,desc) by running `cmd`.
+/* populate a GtkListStore (4 columns: name,state,pid,desc) by running `cmd`.
    mode: 0=list-units (parse units), 1=list-unit-files (parse unit-files) */
 static void populate_store_parsed(GtkListStore *store, const char *cmd, int mode) {
     if (!store || !cmd) return;
@@ -84,6 +101,7 @@ static void populate_store_parsed(GtkListStore *store, const char *cmd, int mode
                                           0, "Error running command",
                                           1, "",
                                           2, "",
+                                          3, "",
                                           -1);
         return;
     }
@@ -93,7 +111,7 @@ static void populate_store_parsed(GtkListStore *store, const char *cmd, int mode
         trim_newline(buf);
         if (buf[0] == '\0') continue;
 
-        char name[512] = {0}, state[128] = {0}, desc[2048] = {0};
+        char name[512] = {0}, state[128] = {0}, desc[2048] = {0}, pid[64] = {0};
         if (mode == 1) {
             parse_list_unit_files_line(buf, name, sizeof(name), state, sizeof(state), desc, sizeof(desc));
         } else {
@@ -107,25 +125,106 @@ static void populate_store_parsed(GtkListStore *store, const char *cmd, int mode
             name[sizeof(name)-1] = '\0';
         }
 
+        /* If description is empty (common with list-unit-files), fetch it */
+        if (desc[0] == '\0') {
+            get_unit_property_value(name, "Description", desc, sizeof(desc));
+        }
+
+        /* Fetch MainPID (may be "0" if not running); treat "0" as empty */
+        get_unit_property_value(name, "MainPID", pid, sizeof(pid));
+        if (pid[0] == '0' && pid[1] == '\0') pid[0] = '\0';
+
         GtkTreeIter iter;
         gtk_list_store_insert_with_values(store, &iter, -1,
                                           0, name,
                                           1, state,
-                                          2, desc,
+                                          2, pid,
+                                          3, desc,
                                           -1);
     }
     pclose(fp);
 }
 
-/* create a scrolled window containing a 3-column treeview backed by a GtkListStore.
-   columns: 0=Name, 1=State, 2=Description
-   returns the scrolled window widget; out_store (if non-NULL) receives the store pointer. */
-static GtkWidget *create_service_list_view(GtkListStore **out_store) {
-    /* 3 string columns */
-    GtkListStore *store = gtk_list_store_new(3, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
+/* Filter helper data */
+typedef struct {
+    AppData *ad;
+    int idx;
+} FilterData;
+
+/* visible_func for GtkTreeModelFilter: matches filter_entry text against name/desc/pid/state */
+static gboolean service_filter_visible(GtkTreeModel *model, GtkTreeIter *iter, gpointer data) {
+    FilterData *fd = (FilterData *)data;
+    if (!fd || !fd->ad || !fd->ad->filter_entry) return TRUE;
+
+    const gchar *filter_txt = gtk_entry_get_text(GTK_ENTRY(fd->ad->filter_entry));
+    if (!filter_txt || filter_txt[0] == '\0') return TRUE; /* no filter -> show all */
+
+    gchar *name = NULL, *state = NULL, *pid = NULL, *desc = NULL;
+    gtk_tree_model_get(model, iter,
+                       0, &name,
+                       1, &state,
+                       2, &pid,
+                       3, &desc,
+                       -1);
+
+    gboolean match = FALSE;
+    gchar *flt_low = g_utf8_strdown(filter_txt, -1);
+
+    if (name && !match) {
+        gchar *s = g_utf8_strdown(name, -1);
+        if (g_strstr_len(s, -1, flt_low)) match = TRUE;
+        g_free(s);
+    }
+    if (desc && !match) {
+        gchar *s = g_utf8_strdown(desc, -1);
+        if (g_strstr_len(s, -1, flt_low)) match = TRUE;
+        g_free(s);
+    }
+    if (pid && !match) {
+        gchar *s = g_utf8_strdown(pid, -1);
+        if (g_strstr_len(s, -1, flt_low)) match = TRUE;
+        g_free(s);
+    }
+    if (state && !match) {
+        gchar *s = g_utf8_strdown(state, -1);
+        if (g_strstr_len(s, -1, flt_low)) match = TRUE;
+        g_free(s);
+    }
+
+    g_free(flt_low);
+    g_free(name); g_free(state); g_free(pid); g_free(desc);
+
+    return match;
+}
+
+/* When filter text changes, refilter all views */
+static void on_filter_changed(GtkEntry *entry, gpointer user_data) {
+    AppData *ad = (AppData *)user_data;
+    if (!ad) return;
+    for (int i = 0; i < 3; ++i) {
+        if (ad->filters[i]) {
+            gtk_tree_model_filter_refilter(ad->filters[i]);
+        }
+    }
+}
+
+/* create a scrolled window containing a 4-column treeview backed by a GtkListStore,
+   wrapped by a GtkTreeModelFilter (so we can filter via the entry).
+   columns: 0=Name, 1=State, 2=PID, 3=Description
+   out_store receives the GtkListStore pointer; ad and idx are recorded for filtering. */
+static GtkWidget *create_service_list_view(AppData *ad, int idx, GtkListStore **out_store) {
+    GtkListStore *store = gtk_list_store_new(4, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
     if (out_store) *out_store = store;
 
-    GtkWidget *tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(store));
+    /* create filter model that wraps the list store */
+    FilterData *fd = g_new0(FilterData, 1);
+    fd->ad = ad;
+    fd->idx = idx;
+    GtkTreeModelFilter *filter = GTK_TREE_MODEL_FILTER(gtk_tree_model_filter_new(GTK_TREE_MODEL(store), NULL));
+    gtk_tree_model_filter_set_visible_func(filter, service_filter_visible, fd, NULL);
+    ad->filters[idx] = filter;
+
+    GtkWidget *tree = gtk_tree_view_new_with_model(GTK_TREE_MODEL(filter));
     gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(tree), TRUE);
 
     GtkCellRenderer *r_text = gtk_cell_renderer_text_new();
@@ -139,7 +238,12 @@ static GtkWidget *create_service_list_view(GtkListStore **out_store) {
     gtk_tree_view_column_set_sizing(col_state, GTK_TREE_VIEW_COLUMN_FIXED);
     gtk_tree_view_column_set_fixed_width(col_state, 120);
 
-    GtkTreeViewColumn *col_desc = gtk_tree_view_column_new_with_attributes("Description", r_text, "text", 2, NULL);
+    GtkTreeViewColumn *col_pid = gtk_tree_view_column_new_with_attributes("PID", r_text, "text", 2, NULL);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col_pid);
+    gtk_tree_view_column_set_sizing(col_pid, GTK_TREE_VIEW_COLUMN_FIXED);
+    gtk_tree_view_column_set_fixed_width(col_pid, 80);
+
+    GtkTreeViewColumn *col_desc = gtk_tree_view_column_new_with_attributes("Description", r_text, "text", 3, NULL);
     gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col_desc);
     gtk_tree_view_column_set_expand(col_desc, TRUE);
 
@@ -190,7 +294,7 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
 
     GtkWidget *win = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(win), "SysD Manager");
-    gtk_window_set_default_size(GTK_WINDOW(win), 800, 500);
+    gtk_window_set_default_size(GTK_WINDOW(win), 900, 550);
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_container_add(GTK_CONTAINER(win), vbox);
@@ -218,18 +322,36 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
 
     gtk_box_pack_start(GTK_BOX(vbox), menubar, FALSE, FALSE, 0);
 
+    /* --- Filter row (new) --- */
+    AppData *ad = g_new0(AppData, 1);
+    GtkWidget *filter_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_set_margin_top(filter_box, 6);
+    gtk_widget_set_margin_bottom(filter_box, 6);
+    gtk_widget_set_margin_start(filter_box, 6);
+    gtk_widget_set_margin_end(filter_box, 6);
+
+    GtkWidget *filter_label = gtk_label_new("Filter:");
+    gtk_box_pack_start(GTK_BOX(filter_box), filter_label, FALSE, FALSE, 0);
+
+    GtkWidget *filter_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(filter_entry), "type substring to match service name, description, pid or state");
+    gtk_box_pack_start(GTK_BOX(filter_box), filter_entry, TRUE, TRUE, 0);
+    ad->filter_entry = filter_entry;
+    g_signal_connect(filter_entry, "changed", G_CALLBACK(on_filter_changed), ad);
+
+    gtk_box_pack_start(GTK_BOX(vbox), filter_box, FALSE, FALSE, 0);
+
     /* --- Notebook with three tabs --- */
     GtkWidget *notebook = gtk_notebook_new();
 
-    AppData *ad = g_new0(AppData, 1);
-
-    GtkWidget *sc1 = create_service_list_view(&ad->stores[0]);
+    /* create views: pass AppData and index so filter can reference entry */
+    GtkWidget *sc1 = create_service_list_view(ad, 0, &ad->stores[0]);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), sc1, gtk_label_new("Running"));
 
-    GtkWidget *sc2 = create_service_list_view(&ad->stores[1]);
+    GtkWidget *sc2 = create_service_list_view(ad, 1, &ad->stores[1]);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), sc2, gtk_label_new("Enabled at Boot"));
 
-    GtkWidget *sc3 = create_service_list_view(&ad->stores[2]);
+    GtkWidget *sc3 = create_service_list_view(ad, 2, &ad->stores[2]);
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), sc3, gtk_label_new("All Services"));
 
     gtk_box_pack_start(GTK_BOX(vbox), notebook, TRUE, TRUE, 0);
@@ -241,17 +363,19 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
     gtk_statusbar_push(GTK_STATUSBAR(statusbar), ctx, "SysD Manager - ready");
     gtk_box_pack_end(GTK_BOX(vbox), statusbar, FALSE, FALSE, 0);
 
-    /* Connect notebook page switch to update status bar and refresh lists.
-       Pass AppData so handler can access statusbar and stores. */
+    /* Connect notebook page switch to update status bar and refresh lists. */
     g_signal_connect(notebook, "switch-page", G_CALLBACK(on_switch_page), ad);
 
-    /* Initial population: populate all three lists (and leave status showing ready) */
+    /* Initial population: populate all three lists */
     populate_store_parsed(ad->stores[0],
         "systemctl --no-legend --no-pager list-units --type=service --state=running", 0);
     populate_store_parsed(ad->stores[1],
         "systemctl --no-legend --no-pager list-unit-files --type=service --state=enabled", 1);
     populate_store_parsed(ad->stores[2],
         "systemctl --no-legend --no-pager list-units --type=service --all", 0);
+
+    /* ensure filter is applied against the initial content */
+    on_filter_changed(GTK_ENTRY(ad->filter_entry), ad);
 
     gtk_widget_show_all(win);
 }
