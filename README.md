@@ -9,5 +9,11 @@ Requires only GTK and libsystemd runtime libraries.
 - Run `sysd-mgr` from terminal
 
 #### Compilation
-- Compile with `gcc -o sysd-mgr sysd-mgr.c -lgtk-3.0 -lsystemd`
+- Compile with gcc sysd-mgr.c -o sysd-mgr `pkg-config --cflags --libs gtk+-3.0`
 - Run `./sysd-mgr` from terminal
+
+
+### Usage & Screenshots
+
+![screenshot](screenshots/all.png)
+![screenshot](screenshots/running-services.png)
